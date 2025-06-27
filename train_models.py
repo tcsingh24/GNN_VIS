@@ -7,6 +7,11 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import os
 import pickle
 import time
+import numpy as np
+from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+import umap.umap_ as umap
+import warnings
 
 # --- Configuration ---
 MODEL_DIR = 'models'
@@ -15,19 +20,20 @@ PROCESSED_DATA_DIR = os.path.join(DATA_DIR, 'processed')
 DATASETS_TO_TRAIN = ['Cora', 'CiteSeer']
 MODELS_TO_TRAIN = ['GCN', 'GAT']
 
+# Suppress warnings from libraries like UMAP/TSNE for cleaner output
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
 # --- General Training Hyperparameters ---
-
 EPOCHS = 500
-
 EARLY_STOPPING_PATIENCE = 50
 
 # --- Model-Specific Hyperparameters ---
-
 GCN_CONFIG = {
     'Cora': {'lr': 0.01, 'weight_decay': 5e-4, 'hidden_channels': 32, 'dropout_rate': 0.5},
     'CiteSeer': {'lr': 0.01, 'weight_decay': 0.01, 'hidden_channels': 32, 'dropout_rate': 0.5}
 }
-
 
 GAT_CONFIG = {
     'Cora': {'lr': 0.005, 'weight_decay': 5e-4, 'hidden_channels': 8, 'heads': 8, 'dropout_rate': 0.6},
@@ -41,7 +47,6 @@ if torch.cuda.is_available():
     print(f"Device name: {torch.cuda.get_device_name(0)}")
 
 # --- Path Management ---
-
 script_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
 model_abs_dir = os.path.join(script_dir, MODEL_DIR)
 data_abs_dir = os.path.join(script_dir, DATA_DIR)
@@ -52,35 +57,39 @@ os.makedirs(data_abs_dir, exist_ok=True)
 os.makedirs(processed_data_abs_dir, exist_ok=True)
 
 # --- Model Definitions ---
-
 class GCNNet(torch.nn.Module):
-    """A standard two-layer GCN model."""
+    """A standard two-layer GCN model with an inference method."""
     def __init__(self, in_channels, hidden_channels, out_channels, dropout_rate=0.5):
         super().__init__()
-        # Using cached=True for performance gain on transductive datasets.
         self.conv1 = GCNConv(in_channels, hidden_channels, cached=True)
         self.conv2 = GCNConv(hidden_channels, out_channels, cached=True)
         self.dropout_rate = dropout_rate
-        # Store init args to allow for easy model reloading.
         self.init_args = {'hidden_channels': hidden_channels, 'dropout_rate': dropout_rate}
 
     def forward(self, x, edge_index):
-        #  F.relu() for applying the activation function.
         x = F.relu(self.conv1(x, edge_index))
         x = F.dropout(x, p=self.dropout_rate, training=self.training)
         x = self.conv2(x, edge_index)
         return F.log_softmax(x, dim=1)
 
+    @torch.no_grad()
+    def inference(self, data):
+        """Full forward pass to get embeddings and final predictions."""
+        self.eval()
+        x, edge_index = data.x, data.edge_index
+        x = F.relu(self.conv1(x, edge_index))
+        embeddings = x  # Capture embeddings from the hidden layer
+        x = self.conv2(x, edge_index)
+        log_probs = F.log_softmax(x, dim=1)
+        return log_probs, embeddings
+
 class GATNet(torch.nn.Module):
-    """A standard two-layer GAT model."""
+    """A standard two-layer GAT model with an inference method."""
     def __init__(self, in_channels, hidden_channels, out_channels, heads=8, dropout_rate=0.6):
         super().__init__()
-        # Dropout is applied at each GAT layer 
         self.conv1 = GATConv(in_channels, hidden_channels, heads=heads, dropout=dropout_rate)
-        # The second layer uses a single head and no concatenation for the final output.
         self.conv2 = GATConv(hidden_channels * heads, out_channels, heads=1, concat=False, dropout=dropout_rate)
         self.dropout_rate = dropout_rate
-        # Store init args for model reloading.
         self.init_args = {'hidden_channels': hidden_channels, 'heads': heads, 'dropout_rate': dropout_rate}
 
     def forward(self, x, edge_index):
@@ -89,6 +98,30 @@ class GATNet(torch.nn.Module):
         x = F.dropout(x, p=self.dropout_rate, training=self.training)
         x = self.conv2(x, edge_index)
         return F.log_softmax(x, dim=1)
+
+    @torch.no_grad()
+    def inference(self, data, return_attention_weights=False):
+        """Full forward pass to get embeddings, predictions, and optionally attention."""
+        self.eval()
+        x, edge_index = data.x, data.edge_index
+        
+        # We need to pass through dropout during inference if we want to match training behavior, but it's often disabled.
+        # For simplicity in pre-computation, we will match the forward pass logic.
+        x = F.dropout(x, p=self.dropout_rate, training=self.training) # Note: self.training will be False
+        x, att1 = self.conv1(x, edge_index, return_attention_weights=True)
+        x = F.elu(x)
+        embeddings = x # Capture embeddings from the hidden layer
+        
+        x = F.dropout(x, p=self.dropout_rate, training=self.training)
+        x, att2 = self.conv2(x, edge_index, return_attention_weights=True)
+        
+        log_probs = F.log_softmax(x, dim=1)
+        attention_weights = (att1, att2)
+        
+        if return_attention_weights:
+            return log_probs, embeddings, attention_weights
+        else:
+            return log_probs, embeddings
 
 
 # --- Dataset Wrapper ---
@@ -111,7 +144,8 @@ def load_training_dataset(name, root_dir, processed_dir):
     processed_file_path = os.path.join(processed_dir, f"{name}_processed.pt")
     if os.path.exists(processed_file_path):
         try:
-            loaded_obj = torch.load(processed_file_path, map_location='cpu', weights_only=False)
+            # Load with legacy pickle=False for compatibility, new PyTorch prefers weights_only
+            loaded_obj = torch.load(processed_file_path, map_location='cpu')
             print(f"    Loaded from pre-processed file: {processed_file_path}")
             return PreprocessedDatasetWrapper(loaded_obj)
         except Exception as e:
@@ -119,7 +153,6 @@ def load_training_dataset(name, root_dir, processed_dir):
     try:
         print(f"    Loading '{name}' using Planetoid...")
         dataset = Planetoid(root=root_dir, name=name)
-        # Create a dictionary to match the structure of the pre-processed file.
         return PreprocessedDatasetWrapper({
             'data': dataset[0],
             'num_node_features': dataset.num_node_features,
@@ -152,9 +185,9 @@ def evaluate(model, data, mask):
 
 # --- Main Training Loop ---
 if __name__ == '__main__':
-    print("--- Starting Hyperparameter-Tuned Model Training Script ---")
+    print("--- Starting Model Training & Pre-computation Script ---")
     for dataset_name in DATASETS_TO_TRAIN:
-        print(f"\n--- Training on Dataset: {dataset_name} ---")
+        print(f"\n--- Processing Dataset: {dataset_name} ---")
         dataset = load_training_dataset(dataset_name, data_abs_dir, processed_data_abs_dir)
         if not dataset:
             continue
@@ -168,17 +201,16 @@ if __name__ == '__main__':
             start_time = time.time()
             
             config = (GCN_CONFIG if model_type == 'GCN' else GAT_CONFIG)[dataset_name]
-            
             model_params = {k: v for k, v in config.items() if k not in ['lr', 'weight_decay']}
 
             if model_type == 'GCN':
                 model = GCNNet(in_channels=dataset.num_node_features,
                                out_channels=dataset.num_classes,
-                               **model_params) 
+                               **model_params)
             elif model_type == 'GAT':
                 model = GATNet(in_channels=dataset.num_node_features,
                                out_channels=dataset.num_classes,
-                               **model_params) 
+                               **model_params)
             else:
                 print(f"    ERROR: Model type '{model_type}' not recognized. Skipping.")
                 continue
@@ -195,17 +227,17 @@ if __name__ == '__main__':
                 train_loss = train_one_epoch(model, data, optimizer)
                 val_acc = evaluate(model, data, data.val_mask)
                 
-                # Learning rate scheduler step
                 scheduler.step(val_acc)
 
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
+                    # Store state dict on CPU to save GPU memory
                     best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
                     epochs_no_improve = 0
                 else:
                     epochs_no_improve += 1
                 
-                if epoch % 20 == 0:
+                if epoch % 50 == 0:
                     test_acc = evaluate(model, data, data.test_mask)
                     print(f"    Epoch: {epoch:03d} | Loss: {train_loss:.4f} | Val Acc: {val_acc:.4f} | Test Acc: {test_acc:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
 
@@ -215,24 +247,81 @@ if __name__ == '__main__':
             
             print(f"  Training finished for {model_type}.")
             
-            # Load the best performing model before final evaluation.
-            if best_model_state:
-                model.load_state_dict(best_model_state)
+            if not best_model_state:
+                print("  WARNING: No best model was saved. Skipping pre-computation.")
+                continue
 
-            final_test_acc = evaluate(model, data, data.test_mask)
-            print(f"    > Best Validation Accuracy: {best_val_acc:.4f}")
-            print(f"    > Final Test Accuracy:      {final_test_acc:.4f}")
+            # --- PRE-COMPUTATION STEP ---
+            print(f"\n  -- Pre-computing artifacts for {model_type} on {dataset_name} --")
+            # Load the best performing model state for inference
+            model.load_state_dict(best_model_state)
+            model.to(device)
+            model.eval()
 
+            # 1. Pre-compute Predictions and Embeddings
+            print("    1. Computing predictions and high-dimensional embeddings...")
+            if model_type == 'GAT':
+                log_probs, embeddings, attention_weights = model.inference(data, return_attention_weights=True)
+            else: # GCN
+                log_probs, embeddings = model.inference(data)
+            
+            predictions = log_probs.argmax(dim=1)
+            embeddings_np = embeddings.cpu().numpy()
+
+            # 2. Pre-compute 2D Embeddings for visualization
+            print("    2. Computing 2D embeddings (PCA, t-SNE, UMAP)...")
+            
+            # PCA (fastest)
+            pca_2d = PCA(n_components=2).fit_transform(embeddings_np)
+            
+            # t-SNE
+            # Adjust perplexity for small datasets to avoid errors
+            perplexity = min(30.0, max(5.0, float(embeddings_np.shape[0] - 1)))
+            tsne_2d = TSNE(n_components=2, perplexity=perplexity, random_state=42, init='pca', learning_rate='auto').fit_transform(embeddings_np)
+            
+            # UMAP
+            # Adjust n_neighbors for small datasets
+            n_neighbors = min(15, embeddings_np.shape[0] - 1)
+            umap_2d = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.1, random_state=42).fit_transform(embeddings_np)
+
+            # 3. Assemble the save package
+            print("    3. Assembling final save package...")
+            save_package = {
+                'model_state_dict': best_model_state,
+                'model_init_args': model.init_args,
+                'predictions': predictions.cpu().tolist(),
+                'embeddings': embeddings.cpu().tolist(), # High-dimensional embeddings
+                'embeddings_2d': {
+                    'pca': pca_2d.tolist(),
+                    'tsne': tsne_2d.tolist(),
+                    'umap': umap_2d.tolist()
+                }
+            }
+            
+            # Add attention weights only for GAT models
+            if model_type == 'GAT':
+                print("    4. Storing GAT attention weights...")
+                # Deconstruct tuple and store on CPU
+                att1, att2 = attention_weights
+                save_package['attention_weights'] = {
+                    'conv1': (att1[0].cpu().tolist(), att1[1].cpu().tolist()),
+                    'conv2': (att2[0].cpu().tolist(), att2[1].cpu().tolist())
+                }
+
+            # 4. Save the comprehensive package to disk
             model_filename = f"{model_type}_{dataset_name}_tuned.pkl"
             model_save_path = os.path.join(model_abs_dir, model_filename)
             
-           
-            save_package = (model.state_dict(), model.init_args)
             with open(model_save_path, 'wb') as f:
-                pickle.dump(save_package, f) # Using pickle 
-            print(f"    Model saved to: {model_save_path}")
+                pickle.dump(save_package, f)
+            
+            print(f"    Successfully pre-computed and saved artifacts to: {model_save_path}")
+            
+            final_test_acc = evaluate(model, data, data.test_mask)
+            print(f"    > Best Validation Accuracy: {best_val_acc:.4f}")
+            print(f"    > Final Test Accuracy:      {final_test_acc:.4f}")
             
             end_time = time.time()
-            print(f"    Total time: {end_time - start_time:.2f}s")
+            print(f"    Total time (train + pre-compute): {end_time - start_time:.2f}s")
             
-    print("\n--- Model Training Script Finished ---")
+    print("\n--- Model Training & Pre-computation Script Finished ---")
